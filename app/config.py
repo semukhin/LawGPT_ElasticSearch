@@ -8,8 +8,8 @@ MAIL_SETTINGS = {
     "MAIL_FROM": "info@lawgpt.ru",
 }
 
-DATABASE_URL = "mysql+pymysql://gen_user:63)$0oJ\\WRP\\$J@194.87.243.188:3306/default_db"
-SECRET_KEY = "your_secret_key"
+DATABASE_URL = "mysql+pymysql://gen_user:63)$0oJ\\WRP\\$J@194.87.243.188:3306/default_db" 
+SECRET_KEY = "63)$0oJ\WRP\$J"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
