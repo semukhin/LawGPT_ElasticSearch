@@ -42,7 +42,7 @@ async def get_current_user_from_token(token: str, db: Session):
     """Проверяет токен и возвращает текущего пользователя."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Не удалось подтвердить учетные данные",
+        detail="401",
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
