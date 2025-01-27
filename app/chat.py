@@ -71,92 +71,40 @@ async def upload_file(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Обрабатывает загрузку файла пользователем."""
-    if not allowed_file(file.filename):
-        raise HTTPException(status_code=400, detail="Неподдерживаемый формат файла")
-
-    # Удаляем старый файл, если он существует
-    old_file_path = os.path.join(UPLOAD_FOLDER, f"{current_user.id}.docx")
-    if os.path.exists(old_file_path):
-        os.remove(old_file_path)
-
-    # Сохраняем новый файл
-    filename = f"{current_user.id}.docx"  # Используем ID пользователя как имя файла
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    with open(file_path, "wb") as buffer:
-        buffer.write(await file.read())
-
-    # Укорачиваем название файла для отображения
-    display_filename = file.filename if len(file.filename) <= MAX_FILENAME_LENGTH else f"{file.filename[:MAX_FILENAME_LENGTH]}..."
-
-    return {"message": "Файл загружен", "filename": display_filename}
+    """Моковый ответ для загрузки файла."""
+    return {
+        "message": "Файл загружен",
+        "filename": "testfile.docx"  # Фиксированное имя файла для теста
+    }
 
 @router.post("/api/remove_file")
 async def remove_file(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Удаляет текущий прикреплённый файл."""
-    try:
-        file_path = os.path.join(UPLOAD_FOLDER, f"{current_user.id}.docx")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            return {"message": "Файл удалён успешно."}
-        else:
-            raise HTTPException(status_code=404, detail="Файл не найден.")
-    except Exception as e:
-        logger.error(f"Ошибка при удалении файла: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка при удалении файла")
+    """Моковый ответ для удаления файла."""
+    return {"message": "Файл удалён успешно."}
 
 @router.post("/api/new_chat")
 async def new_chat(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Создаёт новый чат (тред) для текущего пользователя."""
-    try:
-        # Создаём новый тред
-        new_thread = Thread(user_id=current_user.id)
-        db.add(new_thread)
-        db.commit()
-
-        logger.info(f"Тред создан: {new_thread.id} для пользователя {current_user.id}")
-        return {"thread_id": str(new_thread.id)}  # Возвращаем thread_id как строку
-    except Exception as e:
-        logger.error(f"Ошибка при создании чата: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка при создании чата")
+    """Моковый ответ для создания нового чата."""
+    return {"thread_id": "12345"}  # Фиксированный ID треда для теста
 
 @router.post("/api/chat/{thread_id}/send_message")
 async def send_message(
     thread_id: str,
-    request: MessageRequest,  # Тело запроса с сообщением
-    token: str = Query(...),  # Токен передаётся через параметры запроса
+    request: MessageRequest,
+    token: str = Query(...),
     db: Session = Depends(get_db),
 ):
-    """Обрабатывает отправку сообщения пользователем и возвращает ответ ассистента."""
-    try:
-        current_user = await get_current_user_from_token(token, db)
-    except HTTPException:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Неверный токен")
-
-    # Сохраняем сообщение пользователя в базе данных
-    user_message = Message(thread_id=thread_id, role="user", content=request.message, created_at=datetime.utcnow())
-    db.add(user_message)
-    db.commit()
-
-    # Обрабатываем запрос (например, через GPT или другие обработчики)
-    assistant_response, download_link = await process_chat_message(request.message, thread_id, db, current_user)
-
-    # Сохраняем ответ ассистента в базе данных
-    assistant_message = Message(thread_id=thread_id, role="assistant", content=assistant_response, created_at=datetime.utcnow())
-    db.add(assistant_message)
-    db.commit()
-
-    # Если есть ссылка на скачивание, добавляем её в ответ
-    if download_link:
-        assistant_response += f"\n\nСкачать документ: {download_link}"
-
-    return {"response": assistant_response}
+    """Моковый ответ для отправки сообщения."""
+    return {
+        "response": "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Donec nec condimentum turpis. Vestibulum quis nisi rhoncus, consequat ante ac, bibendum mauris. Sed pellentesque pellentesque magna at hendrerit. Aenean porttitor arcu et condimentum varius. Duis non nunc augue. Donec tristique velit velit, nec facilisis est aliquet sit amet. Pellentesque tempus laoreet leo ut vestibulum. Nam a vehicula nisi, vel vehicula dui. Aliquam sed ante dapibus, eleifend massa eu, rhoncus augue. Pellentesque convallis lobortis lectus, at malesuada orci tincidunt non. Sed non ex efficitur, venenatis risus vel, dictum metus. Quisque ornare magna velit, ac posuere risus sollicitudin vel. Nulla dapibus, lectus sit amet blandit molestie, orci tellus tempor nunc, at tincidunt dui dui nec lacus. Ut vitae dictum quam, sed malesuada nunc. Curabitur facilisis a nisl ut porta. Nulla facilisi. Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum congue enim nec ex vulputate, id maximus ex scelerisque. Pellentesque lectus est, pretium at velit consectetur, finibus sodales orci. Sed ullamcorper feugiat justo. Nunc a auctor quam. Suspendisse ac feugiat risus. Aenean sagittis mauris non libero auctor, sed congue neque sollicitudin. In nec luctus purus, at maximus ligula. Nullam posuere felis quam, auctor sollicitudin nunc semper sit amet. Etiam ac eros volutpat, fringilla urna non, sollicitudin elit. Donec vel arcu ante. Vestibulum in tristique sem. Mauris nulla ipsum, elementum at orci vitae, elementum gravida nulla. Nam consectetur varius risus id facilisis. Nullam dignissim velit sed elit condimentum maximus. Sed sodales mollis orci sit amet facilisis. Curabitur facilisis sit amet augue at luctus. Quisque convallis vitae erat sit amet consectetur. Vivamus convallis dolor nec sapien sollicitudin rhoncus. Donec in dictum est, a vestibulum elit. Aenean vehicula pulvinar nisi, non ultricies orci semper vitae. Maecenas dictum tellus in luctus commodo. Curabitur dignissim sed lacus eget venenatis. Etiam nec tortor sed augue suscipit efficitur ac vel dolor. Nunc augue est, egestas et rutrum sed, tempor a diam. Vivamus finibus at neque eu scelerisque. Maecenas egestas, mi id gravida euismod, augue elit viverra nunc, non pretium arcu tortor a leo. Quisque malesuada, dui a dictum dignissim, tellus dui ultricies dui, sed elementum eros urna semper nunc. Maecenas risus ipsum, interdum eget suscipit eget, luctus vitae leo. Maecenas eget mollis erat, at elementum nisl. Morbi eu odio fringilla, finibus tellus non, mattis nisi. Phasellus consequat quam blandit urna fringilla lobortis. Donec viverra mi sit amet efficitur viverra. Sed tincidunt quam in ligula lacinia cursus. Suspendisse accumsan tortor viverra, dictum risus nec, pretium diam. Nunc laoreet nunc nulla, egestas pretium tellus accumsan ut. Curabitur aliquam interdum leo, ac egestas turpis congue ut. Nullam bibendum est nunc, et aliquam diam convallis a. Morbi et tempor tortor. Quisque pretium mauris a odio commodo, sed commodo ante rutrum. Suspendisse varius imperdiet nisl, non convallis nisi aliquet rutrum. Fusce condimentum, erat at porta ullamcorper, ligula lacus sollicitudin quam, ut iaculis ligula diam vel neque. Nullam tellus ante, pellentesque sit amet lorem et, tristique tempus neque.",  # Фиксированный ответ
+        "download_link": "http://127.0.0.1:8000/download/testfile.docx"  # Фиксированная ссылка
+    }
 
 async def process_chat_message(
     query: str,
@@ -249,10 +197,10 @@ async def process_chat_message(
 
 @router.get("/download/{filename}")
 async def download_docx(filename: str):
-    """Скачивание DOCX-файла."""
-    file_path = os.path.join(DOCUMENTS_FOLDER_DOCX, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Файл не найден")
+    """Моковый ответ для скачивания файла."""
+    # Возвращаем фиктивный файл
+    file_path = Path("testfile.docx")
+    file_path.write_text("Это тестовый файл.")  # Создаём фиктивный файл
     return FileResponse(file_path, filename=filename)
 
 @router.get("/api/threads")
@@ -260,25 +208,27 @@ async def get_threads(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Возвращает список тредов текущего пользователя."""
-    threads = db.query(Thread).filter(Thread.user_id == current_user.id).all()
-    thread_list = [{"id": str(thread.id), "created_at": thread.created_at} for thread in threads]  # thread_id как строка
-    return {"threads": thread_list}
+    """Моковый ответ для получения списка тредов."""
+    return {
+        "threads": [
+            {"id": "12345", "created_at": "2023-10-01T12:00:00"},  # Фиксированные данные
+            {"id": "67890", "created_at": "2023-10-02T12:00:00"}
+        ]
+    }
 
 @router.get("/api/thread/{thread_id}/messages")
 async def get_thread_messages(
-    thread_id: str,  # thread_id теперь строка
+    thread_id: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Возвращает историю сообщений для конкретного треда."""
-    thread = db.query(Thread).filter(Thread.id == thread_id, Thread.user_id == current_user.id).first()
-    if not thread:
-        raise HTTPException(status_code=404, detail="Тред не найден или у вас нет доступа.")
-
-    messages = db.query(Message).filter(Message.thread_id == thread_id).order_by(Message.created_at).all()
-    message_list = [{"role": message.role, "content": message.content, "created_at": message.created_at} for message in messages]
-    return {"messages": message_list}
+    """Моковый ответ для получения сообщений в треде."""
+    return {
+        "messages": [
+            {"role": "user", "content": "Привет!", "created_at": "2023-10-01T12:00:00"},
+            {"role": "assistant", "content": "Здравствуйте! Чем могу помочь?", "created_at": "2023-10-01T12:01:00"}
+        ]
+    }
 
 
 import os
