@@ -5,7 +5,7 @@ from docx import Document
 client = OpenAI(api_key="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")
 
 # Конкретный ассистент ID
-ASSISTANT_ID = "asst_Qm5OAqTV5ZHtLMAIX1S3QAoL"
+ASSISTANT_ID = "asst_6WnW2HLJQ5pfklMCBiAR3qnJ"
 MAX_TOKENS = 8000
 
 def extract_text_from_docx(docx_file_path):
