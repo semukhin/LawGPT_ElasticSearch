@@ -6,7 +6,7 @@ client = OpenAI(api_key="sk-proj-RIZzDMPp-BN9HxonfWYArPh0Soy9EA7NliA4L7OaCCE3xo6
 
 # Конкретный ассистент ID
 ASSISTANT_ID = "asst_6WnW2HLJQ5pfklMCBiAR3qnJ"
-MAX_TOKENS = 8000
+MAX_TOKENS = 16000
 
 def extract_text_from_docx(docx_file_path):
     """
