@@ -1,7 +1,6 @@
 import openai
-import json
-import asyncio
 import os
+import re
 import logging
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, APIRouter
 from fastapi.responses import JSONResponse, FileResponse
@@ -25,6 +24,7 @@ import asyncio
 import inspect
 from fastapi import APIRouter, Depends, HTTPException
 from app.auth import get_current_user
+from app.utils import measure_time
 
 
 # Load environment variables
@@ -61,6 +61,11 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
+def remove_source_references(text: str) -> str:
+    """Удаляет ссылки вида """
+    return re.sub(r'【\d+:\d+†source】', '', text).strip()
+
+
 # ========================== API ДЛЯ ЧАТА ==========================
 
 router = APIRouter()
@@ -73,6 +78,8 @@ router = APIRouter()
 
 from app.handlers.filter_gpt import send_message_to_assistant
 
+
+@measure_time
 async def is_legal_query_gpt(query: str) -> bool:
     """Отправляет запрос в фильтр-ассистент и получает True/False."""
     try:
@@ -98,6 +105,7 @@ async def is_legal_query_gpt(query: str) -> bool:
 
 
 
+@measure_time
 @router.post("/chat/{thread_id}")
 async def chat_in_thread(
     thread_id: str,
@@ -204,6 +212,9 @@ async def chat_in_thread(
         web_links=google_summaries,
         document_summary=garant_results
     )
+
+    # Очистка ответа от ссылок на источники
+    assistant_response = remove_source_references(assistant_response)
     logging.info(f"🧠 Ответ ассистента: {assistant_response}")
 
     user_message = Message(thread_id=thread_id, role="user", content=user_query)
@@ -225,7 +236,7 @@ async def chat_in_thread(
 
 
 # ========================== API ДЛЯ ЗАГРУЗКИ ФАЙЛОВ ==========================
-
+@measure_time
 @router.post("/upload_file")
 async def upload_file(
     file: UploadFile = File(...),
@@ -261,7 +272,7 @@ async def upload_file(
 
 
 # ========================== API ДЛЯ ПОЛУЧЕНИЯ СООБЩЕНИЙ ==========================
-
+@measure_time
 @router.get("/messages/{thread_id}")
 async def get_messages(thread_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     """
@@ -273,7 +284,7 @@ async def get_messages(thread_id: str, current_user: User = Depends(get_current_
 
 
 # ========================== API ДЛЯ СОЗДАНИЯ ТРЕДОВ ==========================
-
+@measure_time
 @router.post("/create_thread")
 async def create_new_thread(
     current_user: User = Depends(get_current_user),
