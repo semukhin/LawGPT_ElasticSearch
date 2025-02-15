@@ -1,4 +1,6 @@
 from openai import OpenAI
+from app.utils import measure_time  # Добавьте импорт
+
 
 # Конфигурация OpenAI
 client = OpenAI(api_key="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")
@@ -6,6 +8,8 @@ client = OpenAI(api_key="sk-proj-0lFg_mOj-t1j779vye_xgpvyY9XIYblyA_Fs1IMeY1RNNHR
 # Конкретный ассистент ID
 ASSISTANT_ID = "asst_jaWku4zA0ufJJuxdG68enKgT"
 
+
+@measure_time
 def send_custom_request(user_query, web_links, document_summary, history_summary=None):
     """
     Отправляет кастомный запрос ассистенту с пользовательским вводом, ссылками, саммари документа и историей переписки.

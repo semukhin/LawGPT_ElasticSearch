@@ -1,12 +1,16 @@
 from openai import OpenAI
 from docx import Document
+from app.utils import measure_time
+
 
 # Конфигурация OpenAI
 client = OpenAI(api_key="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")
 
 # Конкретный ассистент ID
 ASSISTANT_ID = "asst_6WnW2HLJQ5pfklMCBiAR3qnJ"
-MAX_TOKENS = 8000
+MAX_TOKENS = 16000
+
+@measure_time
 
 def extract_text_from_docx(docx_file_path):
     """
@@ -34,6 +38,7 @@ def extract_text_from_docx(docx_file_path):
 
     return chunks
 
+@measure_time
 
 def send_message_to_assistant(content):
     """
@@ -72,7 +77,7 @@ def send_message_to_assistant(content):
     except Exception as e:
         return f"Ошибка при отправке сообщения: {e}"
 
-
+@measure_time
 def process_docx_with_assistant(docx_file_path):
     """
     Отправляет текст из DOCX ассистенту и возвращает общий ответ.

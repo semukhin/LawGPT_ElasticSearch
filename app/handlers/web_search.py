@@ -1,6 +1,8 @@
 import requests
 from bs4 import BeautifulSoup
 from app.handlers.gpt_handler import send_message_to_assistant
+from app.utils import get_url_content
+
 
 # Ваши ключи Google Custom Search
 API_KEY = "AIzaSyAIEt6AC2rHfLb8W90R0Gp_lcFN3RnKQak"
@@ -24,7 +26,7 @@ def summarize_link(link, logs):
         }
 
         # Загружаем HTML страницы
-        response = requests.get(link, headers=headers, timeout=10)
+        response = requests.get(link, headers=headers, verify=False, timeout=10)
         response.raise_for_status()
         html_content = response.text
 
@@ -34,11 +36,11 @@ def summarize_link(link, logs):
         soup = BeautifulSoup(html_content, "html.parser")
         page_text = ' '.join(soup.stripped_strings)
 
-        logs.append(f"[INFO]: Извлечённый текст (первые 500 символов): {page_text[:500]}...")
+        logs.append(f"[INFO]: Извлечённый текст (первые 1000 символов): {page_text[:1000]}...")
 
         # Ограничиваем текст, чтобы не превысить лимит токенов (примерно 4000 токенов)
-        trimmed_text = page_text[:12000]
-        logs.append(f"[INFO]: Ограниченный текст для отправки (первые 500 символов): {trimmed_text[:500]}...")
+        trimmed_text = page_text[:24000]
+        logs.append(f"[INFO]: Ограниченный текст для отправки (первые 1000 символов): {trimmed_text[:1000]}...")
 
         # Отправляем текст на саммари через кастомный ассистент
         logs.append("[INFO]: Отправка текста в кастомного ассистента OpenAI.")
