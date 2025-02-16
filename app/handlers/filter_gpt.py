@@ -68,8 +68,9 @@ async def should_search_external(query: str) -> bool:
         logging.info(f"📌 GPT-Классификация необходимости поиска: {query}")
         logging.info(f"🔍 Нужен поиск? {response}")
 
-        return response == "true"
-
+        if response == "true":
+            return True
+        
     except Exception as e:
         logging.error(f"❌ Ошибка при проверке необходимости поиска: {e}")
         return False
