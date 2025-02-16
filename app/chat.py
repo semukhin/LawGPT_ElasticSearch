@@ -2,7 +2,7 @@ import openai
 import os
 import re
 import logging
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, APIRouter, Request
+from fastapi import Request, UploadFile, File, Form, HTTPException, FastAPI
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -17,6 +17,7 @@ from app.handlers.garant_process import process_garant_request
 from app.handlers.gpt_request import send_custom_request
 from app.handlers.filter_gpt import send_message_to_assistant
 from app.handlers.filter_gpt import should_search_external
+from app.handlers.user_doc_request import extract_text_from_docx
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from app.auth import get_current_user
@@ -111,22 +112,23 @@ async def is_legal_query_gpt(query: str) -> bool:
 @measure_time
 @router.post("/chat/{thread_id}")
 async def chat_in_thread(
+    request: Request,
     thread_id: str,
-    query: dict,
-    request: Request,  # <== Добавляем request для получения текущего хоста и порта
+    query: str = Form(...),
+    file: UploadFile = File(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Отправляет сообщение в тред. Если тред не существует, создаёт новый и возвращает его ID.
+    Отправляет сообщение в тред. Если прикреплен .docx, извлекает из него текст и добавляет к запросу.
+    Если документ есть – отключает поиск в Гаранте и веб-сёрче.
     """
-    user_query = query.get("query")
-    if not user_query:
+    if not query:
         raise HTTPException(status_code=400, detail="Запрос не должен быть пустым!")
 
     # Проверяем, существует ли тред
     thread = db.query(Thread).filter_by(id=thread_id, user_id=current_user.id).first()
-    thread_created = False  # Флаг, был ли создан новый тред
+    thread_created = False
 
     if not thread:
         new_thread = client.beta.threads.create()
@@ -137,64 +139,53 @@ async def chat_in_thread(
         db.add(thread)
         db.commit()
 
-    # Получаем все предыдущие сообщения
-    previous_messages = db.query(Message).filter_by(thread_id=thread_id).all()
+    # Обработка прикрепленного файла
+    extracted_text = ""
+    has_document = False  
 
-    # Проверяем, есть ли хотя бы одно юридическое сообщение
-    has_legal_context = False
-    for msg in previous_messages:
-        if msg.role == "user" and await is_legal_query_gpt(msg.content):
-            has_legal_context = True
-            break  # Достаточно одного юридического сообщения
+    if file and file.filename.endswith(".docx"):
+        has_document = True
+        file_path = os.path.join(UPLOAD_FOLDER, file.filename)
 
-    # Проверяем, является ли текущий запрос юридическим
-    is_legal = await is_legal_query_gpt(user_query)
+        # Убедимся, что папка существует
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-    logging.info(f"📌 Запрос классифицирован как {'юридический' if is_legal else 'НЕ юридический'}: {user_query}")
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
 
-    # Проверяем, нужно ли выполнять поиск в Гаранте и интернете
-    should_search = await should_search_external(user_query)
+        logging.info(f"📂 Файл сохранён: {file_path}")
 
-    if not has_legal_context and not is_legal:
-        assistant_response = "Привет! Я юридический ассистент. Если у вас есть юридический вопрос, уточните, пожалуйста. Например, 'Как расторгнуть договор?'"
-        logging.info(f"👋 НЕ юридический запрос. Ответ: {assistant_response}")
+        # Извлекаем текст из документа
+        extracted_text = extract_text_from_docx(file_path)
+        logging.info(f"📜 Извлечённый текст из документа:\n{extracted_text}")
 
-        db.add(Message(thread_id=thread_id, role="user", content=user_query))
+    # Формируем финальный запрос для ассистента
+    user_query = query
+    if extracted_text:
+        user_query = f"Пользователь прикрепил документ. Его текст:\n{extracted_text}\n\nВопрос: {query}"
+
+    logging.info(f"📝 Итоговый запрос ассистенту:\n{user_query}")
+
+    # Если есть документ – НЕ запускаем Гарант и веб-сёрч
+    if has_document:
+        assistant_response = send_custom_request(user_query=user_query, web_links=None, document_summary=None)
+        logging.info(f"🤖 Ответ ассистента (без поиска): {assistant_response}")
+
+        db.add(Message(thread_id=thread_id, role="user", content=query))
         db.add(Message(thread_id=thread_id, role="assistant", content=assistant_response))
         db.commit()
 
-        response = {"assistant_response": assistant_response}
-        if thread_created:
-            response["new_thread_id"] = thread_id  
-        return response
+        return {
+            "assistant_response": assistant_response,
+            "new_thread_id": thread_id if thread_created else None,
+        }
 
-    # Если поиск не требуется, просто генерируем ответ
-    if not should_search:
-        assistant_response = send_custom_request(user_query=user_query)
-        logging.info(f"🧠 Ответ ассистента без поиска: {assistant_response}")
-
-        db.add(Message(thread_id=thread_id, role="user", content=user_query))
-        db.add(Message(thread_id=thread_id, role="assistant", content=assistant_response))
-        db.commit()
-
-        response = {"assistant_response": assistant_response}
-        if thread_created:
-            response["new_thread_id"] = thread_id  
-        return response
-
-    # Если поиск необходим, выполняем его
+    # === Если документа нет, включаем Гарант и веб-сёрч ===
     logs = []
-    
-    loop = asyncio.get_event_loop()
-    if asyncio.iscoroutinefunction(google_search):
-        google_results_task = asyncio.create_task(google_search(user_query, logs))
-    else:
-        google_results_task = loop.run_in_executor(None, google_search, user_query, logs)
 
-    if asyncio.iscoroutinefunction(process_garant_request):
-        garant_results_task = asyncio.create_task(process_garant_request(user_query, logs, lambda lvl, msg: logs.append(msg)))
-    else:
-        garant_results_task = loop.run_in_executor(None, process_garant_request, user_query, logs, lambda lvl, msg: logs.append(msg))
+    loop = asyncio.get_event_loop()
+    google_results_task = asyncio.create_task(google_search(user_query, logs))
+    garant_results_task = asyncio.create_task(process_garant_request(user_query, logs, lambda lvl, msg: logs.append(msg)))
 
     google_results, garant_results = await asyncio.gather(google_results_task, garant_results_task)
 
@@ -205,42 +196,41 @@ async def chat_in_thread(
 
     assistant_response = send_custom_request(
         user_query=user_query,
-        web_links=google_summaries,
-        document_summary=garant_results
+        web_links=google_summaries if google_summaries else None,
+        document_summary=garant_results if garant_results else None
     )
 
-    # Очистка ответа от ссылок на источники
     assistant_response = remove_source_references(assistant_response)
     logging.info(f"🧠 Ответ ассистента: {assistant_response}")
 
-    db.add(Message(thread_id=thread_id, role="user", content=user_query))
+    db.add(Message(thread_id=thread_id, role="user", content=query))
     db.add(Message(thread_id=thread_id, role="assistant", content=assistant_response))
     db.commit()
 
-    # === Гарантированно добавляем правильный `document_url` ===
+    # === Гарантированно добавляем document_url ===
     document_url = None
     if isinstance(garant_results, dict) and "document_url" in garant_results:
         raw_url = garant_results["document_url"]
         logging.info(f"✅ Найдена оригинальная ссылка: {raw_url}")
 
         # Формируем правильный URL с текущим хостом и портом
-        base_url = str(request.base_url).rstrip("/")  # Убираем лишний `/` в конце
-        document_filename = raw_url.split("/")[-1]  # Извлекаем только имя файла
-        document_url = f"{base_url}/download/{document_filename}"  # Формируем ссылку
+        base_url = str(request.base_url).rstrip("/")
+        document_filename = raw_url.split("/")[-1]
+        document_url = f"{base_url}/download/{document_filename}"
 
         logging.info(f"🔗 Финальная ссылка на скачивание: {document_url}")
     else:
         logging.warning(f"⚠️ Не найден document_url в garant_results: {garant_results}")
 
     response = {"assistant_response": assistant_response}
-    
+
     if document_url:
         response["document_download_url"] = document_url
 
     if thread_created:
         response["new_thread_id"] = thread_id  
 
-    logging.info(f"📨 Финальный JSON-ответ: {response}")  # Проверяем, что `document_download_url` точно добавлен
+    logging.info(f"📨 Финальный JSON-ответ: {response}")
 
     return response
 
