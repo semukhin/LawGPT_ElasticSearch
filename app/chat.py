@@ -2,7 +2,7 @@ import openai
 import os
 import re
 import logging
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, APIRouter
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, APIRouter, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -52,6 +52,9 @@ router = APIRouter()
 # File storage
 UPLOAD_FOLDER = "uploads"
 DOCUMENTS_FOLDER = "processed_documents"
+DOCX_FOLDER = "/Users/admin/Documents/LAWGPT/LawGPT_FastAPI_version/LawGPT_FastAPI_version/documents_docx"
+os.makedirs(DOCX_FOLDER, exist_ok=True)  # Убеждаемся, что папка существует
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 # OAuth2 (Bearer Token) Authentication
@@ -110,6 +113,7 @@ async def is_legal_query_gpt(query: str) -> bool:
 async def chat_in_thread(
     thread_id: str,
     query: dict,
+    request: Request,  # <== Добавляем request для получения текущего хоста и порта
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -155,17 +159,13 @@ async def chat_in_thread(
         assistant_response = "Привет! Я юридический ассистент. Если у вас есть юридический вопрос, уточните, пожалуйста. Например, 'Как расторгнуть договор?'"
         logging.info(f"👋 НЕ юридический запрос. Ответ: {assistant_response}")
 
-        user_message = Message(thread_id=thread_id, role="user", content=user_query)
-        db.add(user_message)
-        db.commit()
-
-        assistant_message = Message(thread_id=thread_id, role="assistant", content=assistant_response)
-        db.add(assistant_message)
+        db.add(Message(thread_id=thread_id, role="user", content=user_query))
+        db.add(Message(thread_id=thread_id, role="assistant", content=assistant_response))
         db.commit()
 
         response = {"assistant_response": assistant_response}
         if thread_created:
-            response["new_thread_id"] = thread_id  # Если тред создан, возвращаем его ID
+            response["new_thread_id"] = thread_id  
         return response
 
     # Если поиск не требуется, просто генерируем ответ
@@ -173,17 +173,13 @@ async def chat_in_thread(
         assistant_response = send_custom_request(user_query=user_query)
         logging.info(f"🧠 Ответ ассистента без поиска: {assistant_response}")
 
-        user_message = Message(thread_id=thread_id, role="user", content=user_query)
-        db.add(user_message)
-
-        assistant_message = Message(thread_id=thread_id, role="assistant", content=assistant_response)
-        db.add(assistant_message)
-
+        db.add(Message(thread_id=thread_id, role="user", content=user_query))
+        db.add(Message(thread_id=thread_id, role="assistant", content=assistant_response))
         db.commit()
 
         response = {"assistant_response": assistant_response}
         if thread_created:
-            response["new_thread_id"] = thread_id  # Если тред создан, возвращаем его ID
+            response["new_thread_id"] = thread_id  
         return response
 
     # Если поиск необходим, выполняем его
@@ -217,20 +213,37 @@ async def chat_in_thread(
     assistant_response = remove_source_references(assistant_response)
     logging.info(f"🧠 Ответ ассистента: {assistant_response}")
 
-    user_message = Message(thread_id=thread_id, role="user", content=user_query)
-    db.add(user_message)
-
-    assistant_message = Message(thread_id=thread_id, role="assistant", content=assistant_response)
-    db.add(assistant_message)
-
+    db.add(Message(thread_id=thread_id, role="user", content=user_query))
+    db.add(Message(thread_id=thread_id, role="assistant", content=assistant_response))
     db.commit()
+
+    # === Гарантированно добавляем правильный `document_url` ===
+    document_url = None
+    if isinstance(garant_results, dict) and "document_url" in garant_results:
+        raw_url = garant_results["document_url"]
+        logging.info(f"✅ Найдена оригинальная ссылка: {raw_url}")
+
+        # Формируем правильный URL с текущим хостом и портом
+        base_url = str(request.base_url).rstrip("/")  # Убираем лишний `/` в конце
+        document_filename = raw_url.split("/")[-1]  # Извлекаем только имя файла
+        document_url = f"{base_url}/download/{document_filename}"  # Формируем ссылку
+
+        logging.info(f"🔗 Финальная ссылка на скачивание: {document_url}")
+    else:
+        logging.warning(f"⚠️ Не найден document_url в garant_results: {garant_results}")
 
     response = {"assistant_response": assistant_response}
     
+    if document_url:
+        response["document_download_url"] = document_url
+
     if thread_created:
-        response["new_thread_id"] = thread_id  # Если тред создан, возвращаем его ID
+        response["new_thread_id"] = thread_id  
+
+    logging.info(f"📨 Финальный JSON-ответ: {response}")  # Проверяем, что `document_download_url` точно добавлен
 
     return response
+
 
 
 
@@ -270,6 +283,17 @@ async def upload_file(
     return {"message": "Файл загружен", "filename": filename}
 
 
+@router.get("/download/{filename}")
+async def download_document(filename: str):
+    """
+    Позволяет скачивать юридические документы .docx.
+    """
+    file_path = os.path.join(DOCX_FOLDER, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Документ не найден")
+
+    return FileResponse(file_path, filename=filename, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
 
 # ========================== API ДЛЯ ПОЛУЧЕНИЯ СООБЩЕНИЙ ==========================
 @measure_time
@@ -282,6 +306,13 @@ async def get_messages(thread_id: str, current_user: User = Depends(get_current_
     return {"messages": [{"role": msg.role, "content": msg.content, "created_at": msg.created_at} for msg in messages]}
 
 
+@router.get("/chat/threads")
+async def get_threads(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Получает все треды текущего пользователя.
+    """
+    threads = db.query(Thread).filter_by(user_id=current_user.id).order_by(Thread.created_at).all()
+    return {"threads": [{"id": thread.id, "created_at": thread.created_at} for thread in threads]}
 
 # ========================== API ДЛЯ СОЗДАНИЯ ТРЕДОВ ==========================
 @measure_time
