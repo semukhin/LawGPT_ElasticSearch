@@ -139,6 +139,24 @@ async def chat_in_thread(
         db.add(thread)
         db.commit()
 
+    # Получаем все предыдущие сообщения
+    previous_messages = db.query(Message).filter_by(thread_id=thread_id).all()
+
+    # ✅ ВЕРНУЛ ПРОВЕРКУ НА "ЮРИДИЧЕСКИЙ ЗАПРОС"
+    has_legal_context = False
+    for msg in previous_messages:
+        if msg.role == "user" and await is_legal_query_gpt(msg.content):
+            has_legal_context = True
+            break  # Достаточно одного юридического сообщения
+
+    # Проверяем, является ли текущий запрос юридическим
+    is_legal = await is_legal_query_gpt(query)
+
+    logging.info(f"📌 Запрос классифицирован как {'юридический' if is_legal else 'НЕ юридический'}: {query}")
+
+    # Проверяем, нужно ли выполнять поиск в Гаранте и интернете
+    should_search = await should_search_external(query)
+
     # Обработка прикрепленного файла
     extracted_text = ""
     has_document = False  
@@ -166,7 +184,21 @@ async def chat_in_thread(
 
     logging.info(f"📝 Итоговый запрос ассистенту:\n{user_query}")
 
-    # Если есть документ – НЕ запускаем Гарант и веб-сёрч
+    # ✅ ЕСЛИ ЗАПРОС НЕ ЮРИДИЧЕСКИЙ И НЕТ ПРЕДЫДУЩЕГО ЮРИДИЧЕСКОГО КОНТЕКСТА
+    if not has_legal_context and not is_legal:
+        assistant_response = "Привет! Я юридический ассистент. Если у вас есть юридический вопрос, уточните, пожалуйста. Например, 'Как расторгнуть договор?'"
+        logging.info(f"👋 НЕ юридический запрос. Ответ: {assistant_response}")
+
+        db.add(Message(thread_id=thread_id, role="user", content=query))
+        db.add(Message(thread_id=thread_id, role="assistant", content=assistant_response))
+        db.commit()
+
+        return {
+            "assistant_response": assistant_response,
+            "new_thread_id": thread_id if thread_created else None,
+        }
+
+    # ✅ ЕСЛИ ЕСТЬ ДОКУМЕНТ – НЕ ЗАПУСКАЕМ ГАРАНТ И ВЕБ-СЁРЧ
     if has_document:
         assistant_response = send_custom_request(user_query=user_query, web_links=None, document_summary=None)
         logging.info(f"🤖 Ответ ассистента (без поиска): {assistant_response}")
@@ -184,15 +216,28 @@ async def chat_in_thread(
     logs = []
 
     loop = asyncio.get_event_loop()
-    google_results_task = asyncio.create_task(google_search(user_query, logs))
-    garant_results_task = asyncio.create_task(process_garant_request(user_query, logs, lambda lvl, msg: logs.append(msg)))
 
+    # Проверяем, является ли google_search асинхронной функцией
+    if asyncio.iscoroutinefunction(google_search):
+        google_results_task = asyncio.create_task(google_search(user_query, logs))
+    else:
+        google_results_task = loop.run_in_executor(None, google_search, user_query, logs)
+
+    # Проверяем, является ли process_garant_request асинхронной функцией
+    if asyncio.iscoroutinefunction(process_garant_request):
+        garant_results_task = asyncio.create_task(process_garant_request(user_query, logs, lambda lvl, msg: logs.append(msg)))
+    else:
+        garant_results_task = loop.run_in_executor(None, process_garant_request, user_query, logs, lambda lvl, msg: logs.append(msg))
+
+    # Ожидаем результаты обеих функций
     google_results, garant_results = await asyncio.gather(google_results_task, garant_results_task)
 
+    # Формируем список результатов веб-поиска
     google_summaries = [f"{result['summary']} ({result['link']})" for result in google_results]
 
     logging.info(f"🌐 Найдено {len(google_summaries)} результатов веб-поиска")
     logging.info(f"📄 Результаты ГАРАНТ: {garant_results}")
+
 
     assistant_response = send_custom_request(
         user_query=user_query,
@@ -233,6 +278,7 @@ async def chat_in_thread(
     logging.info(f"📨 Финальный JSON-ответ: {response}")
 
     return response
+
 
 
 
