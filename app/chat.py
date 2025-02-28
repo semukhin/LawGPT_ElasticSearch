@@ -1,120 +1,77 @@
-import openai
+from openai import OpenAI
+import uuid
 import os
 import re
 import logging
-from fastapi import Request, UploadFile, File, Form, HTTPException, FastAPI
+import asyncio
+from datetime import datetime
+from pathlib import Path
+import unicodedata
+
+from fastapi import Request, UploadFile, File, Form, HTTPException, FastAPI, APIRouter, Depends
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.orm import Session
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
-from typing import Dict, Any
-from werkzeug.utils import secure_filename
+import aiofiles
+from sqlalchemy.orm import Session
+
 from app.database import get_db
 from app.models import User, Message, Thread, Document
 from app.auth import get_current_user
 from app.handlers.web_search import google_search
 from app.handlers.garant_process import process_garant_request
 from app.handlers.gpt_request import send_custom_request
-from app.handlers.filter_gpt import send_message_to_assistant, should_search_external
-from app.handlers.user_doc_request import extract_text_from_docx, extract_text_from_pdf, extract_text_from_any_document
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
-from app.auth import get_current_user
-import asyncio
-import inspect
-from fastapi import APIRouter, Depends, HTTPException
-from app.auth import get_current_user
+from app.handlers.es_law_search import search_law_chunks
+from app.handlers.user_doc_request import extract_text_from_any_document
 from app.utils import measure_time
-from datetime import datetime
 from transliterate import translit
-from pathlib import Path
-import aiofiles
 
 
-
-# Load environment variables
+# Загрузка переменных окружения
 load_dotenv()
 
-# OpenAI API credentials
-OPENAI_API_KEY="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"
-ASSISTANT_ID="asst_jaWku4zA0ufJJuxdG68enKgT"
+# Настройка логирования
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-if not OPENAI_API_KEY or not ASSISTANT_ID:
-    raise ValueError("OPENAI_API_KEY or ASSISTANT_ID is missing from environment variables.")
+# Папки для хранения файлов
+UPLOAD_FOLDER = "uploads"
+DOCX_FOLDER = "documents_docx"
 
-# Initialize OpenAI client
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(DOCX_FOLDER, exist_ok=True)
 
-# FastAPI app instance
+# OAuth2 схема для авторизации
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# Инициализация FastAPI
 app = FastAPI(
-    title="OpenAI Assistant API",
-    description="API for managing OpenAI assistant threads and messages.",
-    version="1.0.0"
+    title="LawGPT Chat API",
+    description="API для обработки чатов с использованием DeepResearch и других источников.",
+    version="2.0.0"
 )
 
 router = APIRouter()
 
-# File storage
-UPLOAD_FOLDER = "uploads"
-DOCUMENTS_FOLDER = "processed_documents"
-DOCX_FOLDER = "/home/semukhin/Documents/GitHub/LawGPT_FastAPI_version/LawGPT_FastAPI_version/documents_docx"
-os.makedirs(DOCX_FOLDER, exist_ok=True) 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# ===================== Модели запросов =====================
 
-# OAuth2 (Bearer Token) Authentication
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-
-
-# ========================== API ДЛЯ ЧАТА ==========================
-
-router = APIRouter()
-
-# Модель запроса
 class ChatRequest(BaseModel):
     query: str
 
-
-# Константы
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-
+# ===================== Вспомогательные функции =====================
 
 @measure_time
-async def is_legal_query_gpt(query: str) -> bool:
+async def process_uploaded_file(file: UploadFile) -> tuple[str, str]:
     """
-    Запрашивает у фильтр-ассистента: является ли запрос юридическим?
-    Возвращает True/False.
+    Сохраняет загруженный файл и извлекает из него текст.
+    
+    Args:
+        file: Загруженный файл от пользователя
+        
+    Returns:
+        tuple[str, str]: Кортеж из (путь_к_файлу, извлеченный_текст)
     """
-    try:
-        classification_prompt = (
-            "Этот запрос юридический? Ответь только 'true' или 'false'.\n"
-            f"Запрос: {query}"
-        )
-        # Используем send_message_to_assistant (функция из filter_gpt)
-        response = await send_message_to_assistant(classification_prompt)
-        response = response.strip().lower()
-
-        logging.info(f"📌 OpenAI GPT-Классификация запроса: {query}")
-        logging.info(f"🔍 Ответ GPT: {response}")
-
-        if response == "true":
-            return True
-        elif response == "false":
-            return False
-        else:
-            logging.warning(f"⚠️ Непредвиденный ответ от ассистента: {response}")
-            return False  # Безопасное значение
-    except Exception as e:
-        logging.error(f"❌ Ошибка при проверке юридической тематики: {e}")
-        return False
-
-
-# Функция обработки загруженных файлов
-async def process_uploaded_file(file: UploadFile):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     original_filename = file.filename.replace(" ", "_")
     filename_no_ext, file_extension = os.path.splitext(original_filename)
@@ -123,218 +80,195 @@ async def process_uploaded_file(file: UploadFile):
     new_filename = f"{timestamp}_{transliterated_filename}{file_extension}"
     file_path = os.path.join(UPLOAD_FOLDER, new_filename)
 
-    with open(file_path, "wb") as buffer:
-        buffer.write(await file.read())
+    async with aiofiles.open(file_path, "wb") as buffer:
+        await buffer.write(await file.read())
 
-    logging.info(f"📁 Файл сохранён: {file_path}")
+    logging.info("Файл сохранён: %s", file_path)
 
-    extracted_text = None
-    if file_extension.lower() == ".docx":
-        extracted_text = extract_text_from_docx(file_path)
-    elif file_extension.lower() == ".pdf":
-        extracted_text = extract_text_from_pdf(file_path)
+    extracted_text = extract_text_from_any_document(file_path)
+    logging.info("Извлечённый текст из файла: %s", extracted_text[:200])  # Показываем первые 200 символов
 
     return file_path, extracted_text
 
 
+def fix_encoding(text):
+    """Пытается исправить проблемы с кодировкой"""
+    if not isinstance(text, str):
+        return text
+        
+    # Проверка на неправильную кодировку
+    if any(ord(c) > 127 for c in text) and 'Ð' in text:
+        # Текст уже в неправильной кодировке, пытаемся исправить
+        try:
+            # Пробуем разные комбинации кодировок
+            for source in ['latin1', 'cp1252', 'iso-8859-1']:
+                for target in ['utf-8', 'cp1251']:
+                    try:
+                        fixed = text.encode(source).decode(target)
+                        if 'а' in fixed or 'А' in fixed:  # Если есть русские буквы
+                            return fixed
+                    except:
+                        pass
+        except:
+            pass
+    return text
 
-# ========================== Основная точка входа: ЧАТ ==========================
+
+
+# ===================== Эндпоинты чата =====================
 @measure_time
 @router.post("/chat/{thread_id}")
 async def chat_in_thread(
     request: Request,
     thread_id: str,
-    query: str = Form(None),
+    query: str = Form(...),
     file: UploadFile = File(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Чат с ассистентом:
-    1. Если пользователь прикрепил файл (DOC/PDF) → извлекаем текст (OCR/parsing), передаём ассистенту.
-    2. Если запрос не юридический → отправляем напрямую (без поиска).
-    3. Если юридический запрос без файла → ищем в Гаранте, интернете и т.д.
+    Основной эндпоинт для общения с ассистентом.
+    Если загружен файл — извлекает текст и передает в DeepResearch.
+    Иначе анализирует запрос и при необходимости использует поиск в Elasticsearch, Гаранте или интернете.
     """
+    # 1. Проверка и нормализация текста запроса
+# Проверка и нормализация текста запроса
+    try:
+        # Исправляем кодировку запроса
+        query = fix_encoding(query)
+        
+        # Нормализация Unicode для решения проблем с составными символами
+        query = unicodedata.normalize('NFC', query)
+        
+        # Логируем запрос, ограничивая длину для читаемости
+        log_query = query[:100] + "..." if len(query) > 100 else query
+        logging.info(f"📥 Получен запрос: thread_id={thread_id}, query='{log_query}'")
+    except Exception as e:
+        logging.error(f"❌ Ошибка декодирования запроса: {str(e)}")
+        # Попытка исправить кодировку, если она неправильная
+        try:
+            query = query.encode('latin1').decode('utf-8')
+            logging.info(f"✅ Исправлена кодировка запроса")
+        except Exception as e:
+            logging.error(f"❌ Не удалось исправить кодировку: {str(e)}")
+        
+    # 2. Проверка кодировки перед дальнейшей обработкой
+    if isinstance(query, str):
+        # Убедимся, что query действительно строка в UTF-8
+        try:
+            query.encode('utf-8').decode('utf-8')
+        except UnicodeError:
+            logging.warning("⚠️ Проблема с кодировкой в тексте запроса, пытаемся исправить")
+            # Дополнительная попытка исправить кодировку
+            try:
+                query = query.encode('latin1').decode('utf-8', errors='replace')
+            except:
+                pass
 
-    # 0. Проверяем, чтобы был хотя бы текст или файл
-    if not query and not file:
-        raise HTTPException(status_code=400, detail="Запрос должен содержать текст или файл")
-
-    # 1. Ищем (или создаём) тред
+    # 3. Проверка и исправление thread_id
+    # Если thread_id буквально равен 'thread_id' или не соответствует формату UUID
+    uuid_pattern = re.compile(r'^thread_[0-9a-f]{32}$')
+    if thread_id == 'thread_id' or (not uuid_pattern.match(thread_id) and not thread_id.startswith('existing_')):
+        # Создаем новый thread_id
+        new_thread_id = f"thread_{uuid.uuid4().hex}"
+        logging.info(f"⚠️ Получен некорректный thread_id: {thread_id}. Создан новый: {new_thread_id}")
+        thread_id = new_thread_id
+    
+    # 4. Поиск или создание треда
     thread = db.query(Thread).filter_by(id=thread_id, user_id=current_user.id).first()
     if not thread:
-        new_thread = client.beta.threads.create()
-        thread_id = new_thread.id
+        logging.info("🔑 Тред не найден. Создаем новый.")
         thread = Thread(id=thread_id, user_id=current_user.id)
         db.add(thread)
         db.commit()
 
-    # 2. (Опционально) получаем последнее сообщение пользователя в этом треде
-    last_message = (
-        db.query(Message)
-        .filter_by(thread_id=thread_id, role="user")
-        .order_by(Message.created_at.desc())
-        .first()
-    )
+    # 5. Обработка файла (если есть)
+    if file:
+        logging.info(f"📄 Обработка загруженного файла: {file.filename}")
+        file_path, extracted_text = await process_uploaded_file(file)
 
-    extracted_text = None  # Сюда поместим распознанный текст, если есть файл
-
-    # 3. Если пользователь прикрепил файл → пропускаем поиск
-    if file and file.filename:
-        try:
-            # (A) Считываем содержимое
-            file_content = await file.read()
-            if not file_content:
-                raise HTTPException(status_code=400, detail="Ошибка: загруженный файл пустой!")
-
-            # (B) Генерируем имя файла
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            original_filename = file.filename.replace(" ", "_")
-            filename_no_ext, file_extension = os.path.splitext(original_filename)
-
-            try:
-                transliterated_filename = translit(filename_no_ext, 'ru', reversed=True)
-            except Exception as e:
-                logging.warning(f"⚠️ Ошибка транслитерации: {str(e)}")
-                transliterated_filename = filename_no_ext
-
-            new_filename = f"{timestamp}_{transliterated_filename}{file_extension}"
-            file_path = os.path.join(UPLOAD_FOLDER, new_filename)
-
-            # (C) Сохраняем файл асинхронно
-            async with aiofiles.open(file_path, "wb") as buffer:
-                await buffer.write(file_content)
-
-            # (D) Проверяем, что файл действительно сохранён
-            if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-                raise HTTPException(status_code=500, detail="Ошибка: файл не был корректно сохранён!")
-
-            logging.info(f"📁 Файл успешно загружен: {file_path}")
-
-            # (E) Сохраняем документ в БД
-            new_document = Document(user_id=current_user.id, file_path=file_path)
-            db.add(new_document)
-            db.commit()
-            db.refresh(new_document)
-
-            # (F) Извлекаем (OCR/parsing) текст
-            extracted_text = extract_text_from_any_document(file_path)
-            logging.info(f"📜 Извлечённый текст:\n{extracted_text}")
-
-        except Exception as e:
-            logging.error(f"❌ Ошибка обработки файла: {str(e)}")
-            raise HTTPException(status_code=500, detail="Ошибка обработки файла")
-
-        # (G) Отправляем в ассистента (без поиска, skip_vector_store=True)
-        assistant_response = send_custom_request(
-            user_query=query,
-            web_links=None,
-            document_summary=extracted_text,  # ВАЖНО: передаём распознанный текст ассистенту
-            skip_vector_store=True
+        # Создаем запрос с учетом содержимого документа
+        enhanced_query = f"{query}\n\nДокумент содержит:\n{extracted_text[:2000]}..."
+        
+        # Передаем thread_id и db в send_custom_request
+        assistant_response = await send_custom_request(
+            user_query=enhanced_query, 
+            thread_id=thread_id,
+            db=db
         )
 
-        # (H) Сохраняем сообщения в БД
-        db.add(Message(thread_id=thread_id, role="user", content=f"Документ: {new_filename}"))
-        db.add(Message(thread_id=thread_id, role="assistant", content=assistant_response))
+        db.add_all([
+            Message(thread_id=thread_id, role="user", content=f"Документ: {file.filename}"),
+            Message(thread_id=thread_id, role="assistant", content=assistant_response)
+        ])
         db.commit()
 
-        # (I) Возвращаем ответ — добавим также recognized_text, чтобы пользователь видел
         return {
             "assistant_response": assistant_response,
             "recognized_text": extracted_text,
-            "file_name": new_filename,
+            "file_name": file.filename,
             "file_path": file_path
         }
+    else:
+        # 6. Обработка текстового запроса
+        logging.info("💬 Обработка текстового запроса без файла.")
 
-    # 4. Если файла нет, проверяем, юридический ли запрос
-    is_legal = await is_legal_query_gpt(query)
-    logging.info(f"📌 Запрос классифицирован как {'юридический' if is_legal else 'НЕ юридический'}: {query}")
-
-    # 4.1 Если запрос не юридический → без поиска
-    if not is_legal:
-        assistant_response = send_custom_request(
-            user_query=query,
-            web_links=None,
-            document_summary=None,
-            skip_vector_store=False
+        # Передаем thread_id и db в send_custom_request
+        assistant_response = await send_custom_request(
+            user_query=query, 
+            thread_id=thread_id,
+            db=db
         )
-        db.add(Message(thread_id=thread_id, role="user", content=query))
-        db.add(Message(thread_id=thread_id, role="assistant", content=assistant_response))
+
+        # Сохраняем сообщения
+        db.add_all([
+            Message(thread_id=thread_id, role="user", content=query),
+            Message(thread_id=thread_id, role="assistant", content=assistant_response)
+        ])
         db.commit()
+
         return {"assistant_response": assistant_response}
+    
+# ===================== Эндпоинты работы с тредами =====================
 
-    # 5. Иначе (юридический запрос без файла), проверяем need_search
-    should_search = await should_search_external(query)
-    if not should_search:
-        # Если поиск не нужен
-        assistant_response = send_custom_request(
-            user_query=query,
-            web_links=None,
-            document_summary=None
-        )
-        db.add(Message(thread_id=thread_id, role="user", content=query))
-        db.add(Message(thread_id=thread_id, role="assistant", content=assistant_response))
-        db.commit()
-        return {"assistant_response": assistant_response, "new_thread_id": thread_id}
-
-    # 6. Запускаем поиск (Гарант, Google)
-    logs = []
-    loop = asyncio.get_event_loop()
-    google_task = loop.run_in_executor(None, google_search, query, logs)
-    garant_task = loop.run_in_executor(None, process_garant_request, query, logs, lambda lvl, msg: logs.append(msg))
-    google_results, garant_results = await asyncio.gather(google_task, garant_task)
-
-    google_summaries = [f"{res['summary']} ({res['link']})" for res in google_results]
-    logging.info(f"🌐 Найдено {len(google_summaries)} результатов веб-поиска")
-    logging.info(f"📄 Результаты ГАРАНТ: {garant_results}")
-
-    # 7. Формируем финальный запрос ассистенту, подмешивая результаты
-    assistant_response = send_custom_request(
-        user_query=query,
-        web_links=google_summaries if google_summaries else None,
-        # Если extracted_text остался None, подмешиваем garant_results, иначе extracted_text
-        document_summary=extracted_text if extracted_text else garant_results if garant_results else None
-    )
-
-    # Убираем служебные ссылки вида 【\d+:\d+†source】
-    assistant_response = remove_source_references(assistant_response)
-
-    # 8. Сохраняем в БД итоговые сообщения
-    db.add(Message(thread_id=thread_id, role="user", content=query))
-    db.add(Message(thread_id=thread_id, role="assistant", content=assistant_response))
+@measure_time
+@router.post("/create_thread")
+async def create_thread(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Создает новый тред для пользователя."""
+    import uuid
+    new_thread_id = f"thread_{uuid.uuid4().hex}"
+    thread = Thread(id=new_thread_id, user_id=current_user.id)
+    db.add(thread)
     db.commit()
-
-    # 9. Если Гарант вернул ссылку на скачивание
-    document_url = None
-    if isinstance(garant_results, dict) and "document_url" in garant_results:
-        base_url = str(request.base_url).rstrip("/")
-        document_filename = garant_results["document_url"].split("/")[-1]
-        document_url = f"{base_url}/download/{document_filename}"
-        logging.info(f"🔗 Финальная ссылка на скачивание: {document_url}")
-
-    # 10. Формируем ответ
-    response = {"assistant_response": assistant_response}
-    if document_url:
-        response["document_download_url"] = document_url
-
-    return response
+    logging.info(f"🆕 Создан новый тред: {new_thread_id}")
+    return {"thread_id": new_thread_id}
 
 
-def remove_source_references(text: str) -> str:
-    """
-    Удаляет ссылки вида 【4:18†...】, 【4:0†...】, 【4:11†...】 и т. п.
-    """
-    # Шаблон: '【\d+:\d+†[^】]*】'
-    # 1) '【' - открывающая скобка
-    # 2) '\d+:\d+' - числа, двоеточие, снова числа (например, 4:18)
-    # 3) '†' - символ '†'
-    # 4) '[^】]*' - любая последовательность символов, кроме '】'
-    # 5) '】' - закрывающая скобка
-    pattern = r'【\d+:\d+†[^】]*】'
-    return re.sub(pattern, '', text).strip()
+@measure_time
+@router.get("/chat/threads")
+async def get_threads(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Возвращает список тредов пользователя."""
+    threads = db.query(Thread).filter_by(user_id=current_user.id).order_by(Thread.created_at.desc()).all()
+    return {"threads": [{"id": t.id, "created_at": t.created_at} for t in threads]}
 
+@measure_time
+@router.get("/messages/{thread_id}")
+async def get_messages(
+    thread_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Возвращает сообщения из выбранного треда."""
+    messages = db.query(Message).filter_by(thread_id=thread_id).order_by(Message.created_at).all()
+    return {"messages": [{"role": m.role, "content": m.content, "created_at": m.created_at} for m in messages]}
 
-# ========================== Прочие эндпоинты ==========================
+# ===================== Эндпоинты для загрузки и скачивания файлов =====================
 
 @measure_time
 @router.post("/upload_file")
@@ -343,104 +277,41 @@ async def upload_file(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    Загружает файл и привязывает его к последнему треду пользователя.
-    (Пример эндпоинта; если нужно, используйте.)
-    """
-    if not file.filename.endswith(".docx"):
-        raise HTTPException(status_code=400, detail="Поддерживаются только .docx файлы.")
+    # Настройка CORS
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    """Загружает файл и сохраняет в базе данных."""
+    if not file.filename.lower().endswith(('.docx', '.pdf')):
+        raise HTTPException(status_code=400, detail="Поддерживаются только файлы .docx и .pdf.")
 
-    thread = db.query(Thread).filter_by(user_id=current_user.id).order_by(Thread.created_at.desc()).first()
-    if not thread:
-        return JSONResponse(status_code=400, content={"error": "Сначала начните чат."})
-
-    filename = file.filename.replace(" ", "_")
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-
-    async with aiofiles.open(file_path, "wb") as buffer:
-        await buffer.write(await file.read())
-
-    file_message = Message(thread_id=thread.id, role="user", content=file_path)
-    db.add(file_message)
+    file_path, _ = await process_uploaded_file(file)
+    
+    new_document = Document(user_id=current_user.id, file_path=file_path)
+    db.add(new_document)
     db.commit()
 
-    return {"message": "Файл загружен", "filename": filename}
-
+    logging.info("📥 Файл '%s' успешно загружен.", file.filename)
+    return {"message": "Файл успешно загружен.", "file_path": file_path}
 
 @router.get("/download/{filename}")
 async def download_document(filename: str):
-    """
-    Позволяет скачивать .docx из DOCUMENTS_FOLDER (пример).
-    """
+    """Позволяет скачать документ."""
     file_path = os.path.join(DOCX_FOLDER, filename)
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Документ не найден")
+        raise HTTPException(status_code=404, detail="Документ не найден.")
 
+    logging.info("📤 Отправка файла '%s' на скачивание.", filename)
     return FileResponse(
-        file_path,
+        path=file_path,
         filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
 
+# ===================== Подключение роутера =====================
 
-# ========================== API ДЛЯ ПОЛУЧЕНИЯ СООБЩЕНИЙ ==========================
-@measure_time
-@router.get("/messages/{thread_id}")
-async def get_messages(
-    thread_id: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Возвращает все сообщения из указанного треда.
-    """
-    messages = (
-        db.query(Message)
-        .filter_by(thread_id=thread_id)
-        .order_by(Message.created_at)
-        .all()
-    )
-    return {"messages": [{"role": msg.role, "content": msg.content, "created_at": msg.created_at} for msg in messages]}
-
-
-
-@router.get("/chat/threads")
-async def get_threads(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Получает все треды текущего пользователя.
-    """
-    threads = (
-        db.query(Thread)
-        .filter_by(user_id=current_user.id)
-        .order_by(Thread.created_at)
-        .all()
-    )
-    return {"threads": [{"id": thread.id, "created_at": thread.created_at} for thread in threads]}
-
-
-
-# ========================== API ДЛЯ СОЗДАНИЯ ТРЕДОВ ==========================
-@measure_time
-@router.post("/create_thread")
-async def create_new_thread(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Создаёт новый тред в OpenAI и сохраняет в БД.
-    """
-    thread = client.beta.threads.create()
-    thread_id = thread.id
-
-    new_thread = Thread(id=thread_id, user_id=current_user.id)
-    db.add(new_thread)
-    db.commit()
-
-    return {"message": "Thread created successfully.", "thread_id": thread_id}
-
-
-# ========================== ПОДКЛЮЧЕНИЕ РОУТЕРА ==========================
 app.include_router(router)
